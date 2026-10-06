@@ -266,8 +266,10 @@ if ! kubectl get secret vss-report-s3 -n "$NAMESPACE" >/dev/null 2>&1; then
   unset REPORT_S3_ACCESS_KEY REPORT_S3_SECRET_KEY
 fi
 
-sed "s/<NAMESPACE>/${NAMESPACE}/g" aks/storage/report-s3.yaml \
-  | kubectl apply -f -
+for manifest in aks/storage/report-s3-service.yaml \
+                aks/storage/report-s3-statefulset.yaml; do
+  sed "s/<NAMESPACE>/${NAMESPACE}/g" "$manifest" | kubectl apply -f -
+done
 kubectl rollout status statefulset/vss-report-s3 -n "$NAMESPACE" --timeout=5m
 kubectl get pvc data-vss-report-s3-0 -n "$NAMESPACE"
 ```
