@@ -16,6 +16,22 @@ nims:
     # Use the A100-compatible INT4 profile for the cache and the NIMService.
     cacheModelProfile: "2ef85c7286907e706eb0d6c4750a1aefa719447097d151ab34c7837fc02bdac4"
 
+agent:
+  vss-agent:
+    extraEnv:
+      - name: VSS_AGENT_OBJECT_STORE_TYPE
+        value: report_object_store
+      - name: NAT_S3_OBJECT_STORE_ACCESS_KEY
+        valueFrom:
+          secretKeyRef:
+            name: vss-report-s3
+            key: AWS_ACCESS_KEY_ID
+      - name: NAT_S3_OBJECT_STORE_SECRET_KEY
+        valueFrom:
+          secretKeyRef:
+            name: vss-report-s3
+            key: AWS_SECRET_ACCESS_KEY
+
 # The workshop applies its browser ingress separately.
 vssIngress:
   enabled: false

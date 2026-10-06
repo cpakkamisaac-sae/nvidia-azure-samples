@@ -1,0 +1,16 @@
+diff --git a/deploy/helm/developer-profiles/dev-profile-lvs/configs/vss-agent/config.yml b/deploy/helm/developer-profiles/dev-profile-lvs/configs/vss-agent/config.yml
+--- a/deploy/helm/developer-profiles/dev-profile-lvs/configs/vss-agent/config.yml
++++ b/deploy/helm/developer-profiles/dev-profile-lvs/configs/vss-agent/config.yml
+@@ -47,5 +47,9 @@
+ object_stores:
+-  local_object_store:
+-    _type: in_memory
+-
++  report_object_store:
++    _type: s3
++    endpoint_url: http://vss-report-s3:8333
++    bucket_name: vss-reports
++    access_key: ${NAT_S3_OBJECT_STORE_ACCESS_KEY}
++    secret_key: ${NAT_S3_OBJECT_STORE_SECRET_KEY}
++
+ functions:

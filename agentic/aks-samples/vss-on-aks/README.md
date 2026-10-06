@@ -2,7 +2,7 @@
 
 This workshop guides you through deploying the **NVIDIA Video Search and Summarization (VSS) Long Video Summarization (LVS)** blueprint on Azure Kubernetes Service (AKS) using a single `Standard_NC96ads_A100_v4` node (4× A100 80 GB GPUs).
 
-Services are exposed through one Azure public IP using the **HAProxy Kubernetes Ingress** controller and [`nip.io`](https://nip.io/) hostnames. This update targets VSS `v3.3.0rc0`: deployment, summarization, and report generation were validated on an existing cluster with two NC48ads nodes (four A100 80 GB GPUs total). Creating a fresh cluster and the browser upload control remain to be validated.
+Services are exposed through one Azure public IP using the **HAProxy Kubernetes Ingress** controller and [`nip.io`](https://nip.io/) hostnames. This update targets VSS `v3.3.0rc0`: deployment, summarization, and report generation were validated on an existing cluster with two NC48ads nodes (four A100 80 GB GPUs total). The AKS driver plus NVIDIA device-plugin path was validated on a separate two-NC24 A100 cluster. On that cluster, a generated report's Markdown and PDF downloads survived both agent and storage-pod restarts. Creating a fresh four-A100 cluster and the browser upload control remain to be validated.
 
 ---
 
@@ -100,12 +100,13 @@ az aks nodepool add \
   --node-count "$GPU_NUM_NODES" \
   --node-vm-size "$GPU_NODE_SIZE" \
   --node-osdisk-size 512 \
-  --gpu-driver none \
   --labels hardware=gpu gpu-sku=a100 \
   --max-pods 110
 ```
 
-> `--gpu-driver none` prevents AKS from installing its own GPU extension — the NVIDIA GPU Operator installed in Task 3 manages the driver instead.
+AKS installs the NVIDIA driver on GPU nodes by default. Task 3 installs the
+device plugin that advertises `nvidia.com/gpu` to Kubernetes. Do not specify
+`--gpu-driver none` for this workshop path.
 
 ### 4. Get cluster credentials
 
@@ -135,31 +136,30 @@ helm repo add nvidia https://helm.ngc.nvidia.com/nvidia --force-update
 helm repo update nvidia
 ```
 
-### 2. Install NVIDIA GPU Operator
+### 2. Install the NVIDIA device plugin
 
-For the new GPU pool created with `--gpu-driver none` in Task 2:
+The fresh AKS node pool from Task 2 has an AKS-installed NVIDIA driver but does
+not advertise GPUs until a device plugin is installed. On a dedicated workshop
+cluster, install the same pinned device plugin used in the two-NC24 validation:
 
 ```bash
-helm install --create-namespace --namespace gpu-operator nvidia/gpu-operator --wait --generate-name
-
+sed "s/<GPU_NODEPOOL>/${GPU_NODEPOOL}/g" aks/gpu/nvidia-device-plugin.yaml \
+  | kubectl apply -f -
+kubectl rollout status daemonset/nvidia-device-plugin-daemonset -n kube-system --timeout=5m
 ```
 
-If reusing AKS nodes that already provide NVIDIA drivers, the container toolkit,
-and the device plugin, keep those components in place. The existing-cluster
-validation used GPU Operator `v26.7.1` with `driver.enabled=false`,
-`toolkit.enabled=false`, and `devicePlugin.enabled=false`. Reuse an existing
-operator installation; do not install a second driver or device plugin.
+The manifest targets the configured `GPU_NODEPOOL`. If you reuse a cluster whose
+GPU nodes already advertise `nvidia.com/gpu`, keep its existing device plugin and
+skip this installation. Do not run a second plugin on those nodes. GPU Operator
+`v26.7.1` made a fresh AKS 1.35.8 / Ubuntu 24.04 GPU node `NotReady` in two
+tests, so it is not part of this workshop path.
 
-### 3. Validate GPU Operator
+### 3. Validate GPU allocation
 
-```bash
-kubectl get pods -n gpu-operator
-```
-
-Wait until all pods are `Running`. Then verify the GPU node reports allocatable GPUs:
+Confirm the GPU node is `Ready` and reports allocatable GPUs:
 
 ```bash
-kubectl get nodes -l agentpool=gpupool \
+kubectl get nodes -l kubernetes.azure.com/agentpool="$GPU_NODEPOOL" \
   -o jsonpath='{.items[0].status.allocatable.nvidia\.com/gpu}'
 ```
 
@@ -245,7 +245,40 @@ The supplied values use `externalTrafficPolicy: Local`, as tested on AKS.
 
 ## Task 5: Deploy VSS LVS Blueprint
 
-### 1. Check out the tested release and apply the A100 cache patch
+### 1. Prepare persistent report storage
+
+The VSS agent otherwise keeps generated Markdown and PDF files in memory, so
+their download links stop working after an agent restart. The workshop uses a
+single-node S3-compatible store backed by an AKS persistent disk. Create its
+credentials once per namespace; retain the Secret and disk while reports must
+remain available:
+
+```bash
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+if ! kubectl get secret vss-report-s3 -n "$NAMESPACE" >/dev/null 2>&1; then
+  export REPORT_S3_ACCESS_KEY="$(openssl rand -hex 16)"
+  export REPORT_S3_SECRET_KEY="$(openssl rand -hex 32)"
+  kubectl create secret generic vss-report-s3 -n "$NAMESPACE" \
+    --from-literal=AWS_ACCESS_KEY_ID="$REPORT_S3_ACCESS_KEY" \
+    --from-literal=AWS_SECRET_ACCESS_KEY="$REPORT_S3_SECRET_KEY" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  unset REPORT_S3_ACCESS_KEY REPORT_S3_SECRET_KEY
+fi
+
+sed "s/<NAMESPACE>/${NAMESPACE}/g" aks/storage/report-s3.yaml \
+  | kubectl apply -f -
+kubectl rollout status statefulset/vss-report-s3 -n "$NAMESPACE" --timeout=5m
+kubectl get pvc data-vss-report-s3-0 -n "$NAMESPACE"
+```
+
+The PVC must be `Bound`. The storage manifest uses `managed-csi-premium`;
+change its StorageClass if your cluster uses another class. Keep the Secret;
+rotating its credentials without updating the store interrupts report access.
+This single-node store is sized for a workshop; plan separate redundancy and
+retention for longer-lived deployments.
+
+### 2. Check out the tested release and apply the A100 and report-store patches
 
 Run from this workshop directory. Keep `WORKSHOP_DIR` for the later commands.
 
@@ -256,6 +289,7 @@ git clone --branch v3.3.0rc0 --single-branch \
 cd video-search-and-summarization
 
 git apply "$WORKSHOP_DIR/aks/patches/nemotron-35-a100-cache-profile.patch"
+git apply "$WORKSHOP_DIR/aks/patches/persistent-report-store.patch"
 helm dependency build deploy/helm/services/nims --skip-refresh
 helm dependency build deploy/helm/developer-profiles/dev-profile-lvs --skip-refresh
 ```
@@ -267,14 +301,16 @@ It uses **Nemotron 3.5 Lightning 30B-A3B** for the LLM and the integrated
 
 On A100, the unmodified Nemotron `NIMCache` selects multiple model profiles,
 including NVFP4 profiles the hardware cannot serve, into its 100 GiB PVC.
-The patch adds an optional `cacheModelProfile` selector; the workshop values
-pin it to the INT4 profile also used by the NIMService. This patch was validated
-locally with `v3.3.0rc0` and is required until it is included upstream.
+The cache patch adds an optional `cacheModelProfile` selector; the workshop
+values pin it to the INT4 profile also used by the NIMService. The report patch
+switches the agent from in-memory storage to its included S3 object-store
+provider. Both patches target `v3.3.0rc0` and are needed until equivalent
+changes are included upstream.
 
 The source tag pins the charts. Some RC images use `develop-latest`, so their
 contents can change between deployments even with the source tag pinned.
 
-### 2. Create NGC secrets outside Helm values
+### 3. Create NGC secrets outside Helm values
 
 ```bash
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml \
@@ -295,7 +331,7 @@ kubectl create secret docker-registry ngc-secret -n "$NAMESPACE" \
 The A100 values set `ngc.createSecrets: false`, keeping the key out of Helm
 release values. Do not commit keys or rendered Secret manifests.
 
-### 3. Install the LVS chart
+### 4. Install the LVS chart
 
 ```bash
 cd deploy/helm/developer-profiles
@@ -311,7 +347,7 @@ helm upgrade --install "$RELEASE" ./dev-profile-lvs \
 `managed-csi-premium` is the tested Azure StorageClass. Check `kubectl get sc`
 and change the workshop value if your cluster uses another class.
 
-### 4. Wait for model cache and workloads
+### 5. Wait for model cache and workloads
 
 ```bash
 kubectl get nimcache,nimservice,pvc -n "$NAMESPACE"
@@ -376,6 +412,26 @@ relevant pod logs if a step fails. The report generation and artifact links
 were validated on the A100 deployment; browser upload should be confirmed in
 each workshop run.
 
+### Instructor readiness check: report persistence
+
+Before attendees use a **dedicated** lab deployment, save both URLs from a
+newly generated report, restart the agent, and confirm the **same URLs** still
+download the Markdown and PDF. Do not restart the shared agent during an
+attendee session.
+
+```bash
+kubectl rollout restart deployment/vss-agent -n "$NAMESPACE"
+kubectl rollout status deployment/vss-agent -n "$NAMESPACE" --timeout=5m
+curl -fsS -o /dev/null "<SAVED_MARKDOWN_URL>"
+curl -fsS -o /dev/null "<SAVED_PDF_URL>"
+```
+
+On the isolated two-NC24 validation cluster, a report generated for a synthetic
+12-second video returned HTTP 200 for both formats. The same URLs returned
+identical files after restarting the agent and after restarting the storage
+pod. This validates report persistence through those restarts, not a fresh
+four-A100 deployment.
+
 ---
 
 ## Cleanup
@@ -386,6 +442,7 @@ Do not run these commands against a shared cluster or resource group.
 ```bash
 helm uninstall "$RELEASE" -n "$NAMESPACE"
 kubectl delete nimcache --all -n "$NAMESPACE"
+kubectl delete statefulset,service vss-report-s3 -n "$NAMESPACE"
 kubectl delete pvc --all -n "$NAMESPACE"
 helm uninstall vss-haproxy -n vss-ingress
 ```
